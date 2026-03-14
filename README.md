@@ -6,7 +6,9 @@ https://github.com/user-attachments/assets/a1834197-3059-438c-a2dc-716e8ec9078f
 
 https://github.com/user-attachments/assets/ad0fa0ce-0f5f-4d1d-a99b-22e67e5fb80b
 
+## About this fork
 
+Hacky solution to get meikipop working on KDE Wayland using KWin scripting, D-Bus and Spectacle. Tested on Plasma 6.6. Currently only works without a hotkey.
 
 ## features
 
