@@ -8,7 +8,7 @@ from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QColor, QCursor, QFont, QFontMetrics, QFontInfo
 from PyQt6.QtWidgets import QWidget, QVBoxLayout, QLabel, QFrame, QApplication
 
-from src.config.config import config, IS_MACOS
+from src.config.config import config, IS_MACOS, IS_WAYLAND
 from src.dictionary.lookup import DictionaryEntry, KanjiEntry
 from src.gui.magpie_manager import magpie_manager
 
@@ -51,6 +51,8 @@ class Popup(QWidget):
             Qt.WindowType.WindowStaysOnTopHint |
             Qt.WindowType.Tool
         )
+        if IS_WAYLAND:
+            self.setWindowTitle("meikipop-popup")
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setStyleSheet("background: transparent;")
 
@@ -169,13 +171,23 @@ class Popup(QWidget):
             self.setFixedSize(new_size)
         self._last_latest_data = latest_data
 
+        mx, my = self.input_loop.get_mouse_pos()
+
         if self._latest_data and self.input_loop.is_virtual_hotkey_down():
-            self.show_popup()
+            self.show_popup(mx, my)
         else:
             self.hide_popup()
 
-        mouse_pos = QCursor.pos()
-        self.move_to(mouse_pos.x(), mouse_pos.y())
+        if self.is_visible:
+            if IS_WAYLAND:
+                abs_x, abs_y = self.compute_position(mx, my)
+                w = self.size().width()
+                h = self.size().height()
+                provider = self.input_loop.mouse_provider
+                if hasattr(provider, 'set_popup_geometry'):
+                    provider.set_popup_geometry(abs_x, abs_y, w, h)
+            else:
+                self.move_to(mx, my)
 
     def _render_kanji_entry(self, entry: KanjiEntry):
         # Colors and sizes from config
@@ -320,6 +332,33 @@ class Popup(QWidget):
         final_size = QSize(int(optimal_content_width) + horizontal_padding, final_height + vertical_padding)
         return full_html, final_size
 
+    def compute_position(self, x, y) -> tuple[int, int]:
+        """Compute absolute popup position without calling move().
+
+        Runs the same logic as move_to() but returns (final_x, final_y).
+        Used by show_popup() on Wayland to convert to cursor-relative offset.
+        """
+        cursor_point = QPoint(x, y)
+        screen = QApplication.screenAt(cursor_point) or QApplication.primaryScreen()
+        screen_geo = screen.geometry()
+        popup_size = self.size()
+        offset = 15
+
+        ratio = screen.devicePixelRatio()
+        x, y = magpie_manager.transform_raw_to_visual((int(x), int(y)), ratio)
+
+        mode = config.popup_position_mode
+        
+        final_x = x + offset
+        if final_x + popup_size.width() > screen_geo.right(): final_x = screen_geo.right() - popup_size.width()
+        if final_x < screen_geo.left(): final_x = screen_geo.left()
+        preferred_y = y + offset
+        final_y = preferred_y if preferred_y + popup_size.height() <= screen_geo.bottom() else y - popup_size.height() - offset
+
+        final_x = max(screen_geo.left(), min(final_x, screen_geo.right() - popup_size.width()))
+        final_y = max(screen_geo.top(), min(final_y, screen_geo.bottom() - popup_size.height()))
+        return (int(final_x), int(final_y))
+
     def move_to(self, x, y):
         cursor_point = QPoint(x, y)
         screen = QApplication.screenAt(cursor_point) or QApplication.primaryScreen()
@@ -407,6 +446,10 @@ class Popup(QWidget):
             return
         self.hide()
         self.is_visible = False
+        if IS_WAYLAND:
+            provider = self.input_loop.mouse_provider
+            if hasattr(provider, 'clear_popup_geometry'):
+                provider.clear_popup_geometry()
         QTimer.singleShot(50, lambda: self._release_lock_safely())  # prevent popup from being screenshotted
         self._restore_focus_on_mac()
 
@@ -415,18 +458,38 @@ class Popup(QWidget):
         self.shared_state.screen_lock.release()
         logger.debug("...successfully released lock by hide_popup")
 
-    def show_popup(self):
+    def show_popup(self, cursor_x: int = 0, cursor_y: int = 0):
         # logger.debug(f"show_popup triggered while visibility:{self.is_visible}")
         if self.is_visible:
             return
+
+        if IS_WAYLAND:
+            from src.gui.kwin_mouse_provider import KWinMouseProvider
+            provider = self.input_loop.mouse_provider
+            if isinstance(provider, KWinMouseProvider) and not provider.has_cursor_data:
+                return
+
         logger.debug("show_popup acquiring lock...")
         self.shared_state.screen_lock.acquire()
         logger.debug("...successfully acquired lock by show_popup")
 
         self._store_active_window_on_mac()
-        self.show()
-        if IS_MACOS:
-            self.raise_()
+
+        if IS_WAYLAND:
+            self.show()
+            abs_x, abs_y = self.compute_position(cursor_x, cursor_y)
+            w = self.size().width()
+            h = self.size().height()
+            provider = self.input_loop.mouse_provider
+            if hasattr(provider, 'set_popup_geometry'):
+                provider.set_popup_geometry(abs_x, abs_y, w, h)
+            QTimer.singleShot(100, lambda: self.setWindowOpacity(1.0))
+            logger.debug(f"Wayland popup: KWin JS move to ({abs_x},{abs_y},{w},{h})")
+        else:
+            self.show()
+            self.move_to(cursor_x, cursor_y)
+            if IS_MACOS:
+                self.raise_()
 
         self.is_visible = True
 

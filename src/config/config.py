@@ -1,6 +1,7 @@
 # src/config/config.py
 import configparser
 import logging
+import os
 import sys
 
 logger = logging.getLogger(__name__)
@@ -11,6 +12,7 @@ MAX_DICT_ENTRIES = 10
 IS_LINUX = sys.platform.startswith('linux')
 IS_WINDOWS = sys.platform.startswith('win')
 IS_MACOS = sys.platform.startswith('darwin')
+IS_WAYLAND = IS_LINUX and os.environ.get('XDG_SESSION_TYPE') == 'wayland'
 
 class Config:
     _instance = None

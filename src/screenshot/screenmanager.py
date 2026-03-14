@@ -8,6 +8,8 @@ from PIL import Image
 
 from src.config.config import config
 from src.gui.region_selector import RegionSelector
+from src.config.config import IS_WAYLAND
+from src.screenshot.spectacle import SpectacleBackend
 
 logger = logging.getLogger(__name__) # Get the logger
 
@@ -18,6 +20,7 @@ class ScreenManager(threading.Thread):
         self.shared_state = shared_state
         self.monitor = None
         self.last_ocr_put_time = 0.0
+        self.last_screenshot_bytes = None
         self.last_screenshot = None
         self.last_mouse_pos = None
         self.input_loop = input_loop
@@ -65,15 +68,25 @@ class ScreenManager(threading.Thread):
                 processing_duration = time.perf_counter() - start_time
                 logger.debug(f"Screenshot {screenshot.size} complete in {processing_duration:.2f}s")
 
-                if self.last_screenshot and self.last_screenshot.raw == screenshot.raw:
-                    logger.debug(f"Screen content didnt change... skipping ocr")
-                    self._sleep_and_handle_loop_exit(0.1)
-                    continue
-
-                self.last_screenshot = screenshot
-                self.last_mouse_pos = self.input_loop.get_mouse_pos()
-                img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
-                self.shared_state.ocr_queue.put(img)
+                if IS_WAYLAND:
+                    screenshot_bytes = screenshot.tobytes()
+                    if self.last_screenshot_bytes and self.last_screenshot_bytes == screenshot_bytes:
+                        logger.debug(f"Screen content didnt change... skipping ocr")
+                        self._sleep_and_handle_loop_exit(0.1)
+                        continue
+                    self.last_screenshot_bytes = screenshot_bytes
+                    self.last_mouse_pos = self.input_loop.get_mouse_pos()
+                    self.shared_state.ocr_queue.put(screenshot)
+                else:
+                    if self.last_screenshot and self.last_screenshot.raw == screenshot.raw:
+                        logger.debug(f"Screen content didnt change... skipping ocr")
+                        self._sleep_and_handle_loop_exit(0.1)
+                        continue
+                    self.last_screenshot = screenshot
+                    self.last_mouse_pos = self.input_loop.get_mouse_pos()
+                    img = Image.frombytes("RGB", screenshot.size, screenshot.bgra, "raw", "BGRX")
+                    self.shared_state.ocr_queue.put(img)
+                    
                 self.last_ocr_put_time = time.perf_counter()
             except:
                 logger.exception("An unexpected error occurred in the screenshot loop. Continuing...")
@@ -81,9 +94,12 @@ class ScreenManager(threading.Thread):
         logger.debug("Screenshot thread stopped.")
 
     def take_screenshot(self):
-        with mss.mss() as sct:
-            sct_img = sct.grab(self.monitor)
-            return sct_img
+        if IS_WAYLAND:
+            return SpectacleBackend.capture(self.monitor)
+        else:
+            with mss.mss() as sct:
+                sct_img = sct.grab(self.monitor)
+                return sct_img
 
     def set_scan_region(self):
         scan_rect = RegionSelector.get_region()
@@ -98,12 +114,21 @@ class ScreenManager(threading.Thread):
 
     def set_scan_screen(self, screen_index):
         logger.info(f"Set scan area to screen {screen_index}")
-        with mss.mss() as sct:
-            if screen_index < len(sct.monitors):
+        if IS_WAYLAND:
+            screens = SpectacleBackend.get_screens()
+            if screen_index < len(screens):
                 logger.info(f"Set scan area to screen {screen_index}")
-                self.monitor = sct.monitors[screen_index]
+                self.monitor = screens[screen_index]
             else:
                 logger.error(f"Cannot set scan screen: index {screen_index} is out of bounds.")
+        else:
+            with mss.mss() as sct:
+                if screen_index < len(sct.monitors):
+                    logger.info(f"Set scan area to screen {screen_index}")
+                    self.monitor = sct.monitors[screen_index]
+                else:
+                    logger.error(f"Cannot set scan screen: index {screen_index} is out of bounds.")
+
 
     def get_scan_geometry(self):
         if not self.monitor:
@@ -123,5 +148,8 @@ class ScreenManager(threading.Thread):
 
     @staticmethod
     def get_screens():
-        with mss.mss() as sct:
-            return sct.monitors
+        if IS_WAYLAND:
+            return SpectacleBackend.get_screens()
+        else:
+            with mss.mss() as sct:
+                    return sct.monitors

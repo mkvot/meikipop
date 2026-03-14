@@ -5,17 +5,17 @@ import threading
 import time
 
 from pynput import mouse
+from src.config.config import config, IS_LINUX, IS_MACOS, IS_WAYLAND
+from src.gui.kwin_mouse_provider import create_mouse_provider
 
-from src.config.config import config, IS_LINUX, IS_MACOS
-
-if IS_LINUX:
+if IS_LINUX and not IS_WAYLAND:
     from Xlib import display as xlib_display
     from Xlib.error import XError
     from Xlib import XK
 elif IS_MACOS:
     import Quartz
     from AppKit import NSEvent
-else:
+elif not IS_LINUX:
     import keyboard
 
 
@@ -132,19 +132,30 @@ class MacOSKeyboardController:
             return True
         except Exception as e:
             logger.warning(f"Error checking hotkey state: {e}")
-            return False
+
+class WaylandHotkeyPlaceholder:
+    "Placeholder for Wayland."
+    def is_hotkey_pressed(self) -> bool:
+        return False
 
 class InputLoop(threading.Thread):
+    mouse_provider = None
+
     def __init__(self, shared_state):
         super().__init__(daemon=True, name="InputLoop")
         self.shared_state = shared_state
-        self.mouse_controller = mouse.Controller()
+        if not IS_WAYLAND:
+            self.mouse_controller = mouse.Controller()
+        else:
+            InputLoop.mouse_provider = create_mouse_provider()
 
         self.hotkey_str = config.hotkey.lower()
-        if IS_LINUX:
+        if IS_LINUX and not IS_WAYLAND:
             self.keyboard_controller = LinuxX11KeyboardController(self.hotkey_str)
         elif IS_MACOS:
             self.keyboard_controller = MacOSKeyboardController(self.hotkey_str)
+        elif IS_WAYLAND:
+            self.keyboard_controller = LinuxX11KeyboardController(self.hotkey_str) if not IS_WAYLAND else WaylandHotkeyPlaceholder()
         else: # IS_WINDOWS
             self.keyboard_controller = WindowsKeyboardController(self.hotkey_str)
 
@@ -160,7 +171,10 @@ class InputLoop(threading.Thread):
                 time.sleep(0.1)
                 continue
             try:
-                current_mouse_pos = self.mouse_controller.position
+                if not IS_WAYLAND:
+                    current_mouse_pos = self.mouse_controller.position
+                else:
+                    current_mouse_pos = InputLoop.mouse_provider.get_position()
                 try:
                     hotkey_is_pressed = self.keyboard_controller.is_hotkey_pressed()
                 except Exception:
@@ -193,6 +207,8 @@ class InputLoop(threading.Thread):
             except:
                 logger.exception("An unexpected error occurred in the input loop. Continuing...")
             finally:
+                if IS_WAYLAND:
+                    InputLoop.mouse_provider.process_events()
                 time.sleep(0.01)
         logger.debug("Input thread stopped.")
 
@@ -203,16 +219,21 @@ class InputLoop(threading.Thread):
     def reapply_settings(self):
         logger.debug(f"InputLoop: Re-applying settings. New hotkey: '{config.hotkey}'.")
         self.hotkey_str = config.hotkey.lower()
-        if IS_LINUX:
+        if IS_LINUX and not IS_WAYLAND:
             self.keyboard_controller = LinuxX11KeyboardController(self.hotkey_str)
         elif IS_MACOS:
             self.keyboard_controller = MacOSKeyboardController(self.hotkey_str)
+        elif IS_WAYLAND:
+            self.keyboard_controller = WaylandHotkeyPlaceholder()
         else: # IS_WINDOWS
             self.keyboard_controller = WindowsKeyboardController(self.hotkey_str)
 
     @staticmethod
     def get_mouse_pos():
-        with mouse.Controller() as mc:
-            pos = mc.position
-            # Convert floats to integers for QPoint compatibility
-            return (int(pos[0]), int(pos[1]))
+        if not IS_WAYLAND:
+            with mouse.Controller() as mc:
+                pos = mc.position
+                # Convert floats to integers for QPoint compatibility
+                return (int(pos[0]), int(pos[1]))
+        else:
+            return InputLoop.mouse_provider.get_position()

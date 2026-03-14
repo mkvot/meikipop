@@ -89,6 +89,10 @@ def main():
     shared_state.ocr_queue.put(None)
     shared_state.hit_scan_queue.put((False, None))
     shared_state.lookup_queue.put(None)
+    # Clean up Wayland resources (KWin script, D-Bus service)
+    if hasattr(input_loop, 'mouse_provider') or InputLoop.mouse_provider:
+        InputLoop.mouse_provider.cleanup()
+
     sys.exit(exit_code)
 
 
