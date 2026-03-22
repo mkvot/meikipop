@@ -1,5 +1,4 @@
 # customdict.py
-import json
 import logging
 import pickle
 import time
@@ -7,95 +6,134 @@ from collections import defaultdict
 
 from src.config.config import IS_WINDOWS
 
-logger = logging.getLogger(__name__)  # Get the logger
+logger = logging.getLogger(__name__)
 
+DEFAULT_FREQ = 999_999
+
+# MapEntry tuple field indices. value: (written_form, reading, freq, entry_id)
+WRITTEN_FORM_INDEX = 0
+READING_INDEX = 1
+FREQUENCY_INDEX = 2
+ENTRY_ID_INDEX = 3
 
 class Dictionary:
     def __init__(self):
-        self.entries = []
-        self.lookup_kan = defaultdict(list)
-        self.lookup_kana = defaultdict(list)
-        self.kanji_entries = {}
-        self.deconjugator_rules = []
-        self.priority_map = {}
+        # Core entries: {entry_id: [sense, ...]}
+        # Each sense: {'glosses': [...], 'pos': [...], 'misc': [...]}
+        self.entries: dict[int, list] = {}
+
+        # lookup_map: surface_form → [(written_form, reading_or_None, freq, entry_id), ...]
+        self.lookup_map: dict[str, list] = defaultdict(list)
+
+        # Kanji character entries from kanjidic2: {character: {...}}
+        self.kanji_entries: dict[str, dict] = {}
+
+        # Deconjugation rules consumed by Deconjugator at runtime
+        self.deconjugator_rules: list[dict] = []
+
         self._is_loaded = False
-
-    def import_jmdict_json(self, json_paths: list[str]):
-        all_jmdict_entries = []
-        for path in sorted(json_paths):
-            with open(path, 'r', encoding='utf-8') as f:
-                all_jmdict_entries.extend(json.load(f))
-        for entry_data in all_jmdict_entries:
-            kebs = [k['keb'] for k in entry_data.get('k_ele', [])]
-            rebs = [r['reb'] for r in entry_data.get('r_ele', [])]
-            senses_processed = []
-            last_pos = []
-            for sense in entry_data.get('sense', []):
-                glosses = [g for g in sense.get('gloss', [])]
-                pos = sense.get('pos', last_pos)
-                last_pos = pos
-                if glosses:
-                    senses_processed.append({'glosses': glosses, 'pos': [p.strip('&;') for p in pos]})
-            if not (kebs or rebs) or not senses_processed:
-                continue
-            entry = {'id': entry_data['seq'], 'kebs': kebs, 'rebs': rebs, 'senses': senses_processed,
-                     'raw_k_ele': entry_data.get('k_ele', []), 'raw_r_ele': entry_data.get('r_ele', []),
-                     'raw_sense': entry_data.get('sense', [])}
-            self.entries.append(entry)
-            entry_index = len(self.entries) - 1
-            for keb in kebs:
-                self.lookup_kan[keb].append(entry_index)
-            for reb in rebs:
-                self.lookup_kana[reb].append(entry_index)
-
-    def import_kanjidic_json(self, json_path: str):
-        with open(json_path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            for entry in data:
-                self.kanji_entries[entry['character']] = entry
-
-    def import_deconjugator(self, json_path: str):
-        with open(json_path, 'r', encoding='utf-8') as f:
-            rules = json.load(f)
-            self.deconjugator_rules = [r for r in rules if isinstance(r, dict)]
-
-    def import_priority(self, json_path: str):
-        with open(json_path, 'r', encoding='utf-8') as f:
-            priority_data = json.load(f)
-            for item in priority_data:
-                key = (item[0], item[1])
-                self.priority_map[key] = item[2]
-
-    def save_dictionary(self, file_path: str):
-        data_to_save = {'entries': self.entries, 'lookup_kan': self.lookup_kan, 'lookup_kana': self.lookup_kana,
-                        'kanji_entries': self.kanji_entries, 'deconjugator_rules': self.deconjugator_rules,
-                        'priority_map': self.priority_map}
-        with open(file_path, 'wb') as f:
-            pickle.dump(data_to_save, f, protocol=pickle.HIGHEST_PROTOCOL)
 
     def load_dictionary(self, file_path: str) -> bool:
         if self._is_loaded:
             return True
-        logger.info("Loading dictionary from file...")
-        start_time = time.perf_counter()
+        logger.info("Loading dictionary ...")
+        start = time.perf_counter()
         try:
             with open(file_path, 'rb') as f:
                 data = pickle.load(f)
-            self.entries = data['entries']
-            self.lookup_kan = data['lookup_kan']
-            self.lookup_kana = data['lookup_kana']
-            self.deconjugator_rules = data['deconjugator_rules']
-            self.priority_map = data['priority_map']
-            self.kanji_entries = data.get('kanji_entries', {})
+            self.entries            = data['entries']
+            self.lookup_map         = data['lookup_map']
+            self.kanji_entries      = data.get('kanji_entries', {})
+            self.deconjugator_rules = data.get('deconjugator_rules', [])
             self._is_loaded = True
-            duration = time.perf_counter() - start_time
-            logger.info(f"Dictionary loaded in {duration:.2f} seconds.")
+            n_refs = sum(len(v) for v in self.lookup_map.values())
+            logger.info(
+                f"Dictionary loaded in {time.perf_counter() - start:.2f}s  "
+                f"({len(self.entries)} core entries, {n_refs} lookup refs)"
+            )
+            self._validate()
             return True
         except FileNotFoundError:
-            script_extension = "bat" if IS_WINDOWS else "sh"
             logger.error(
-                f"ERROR: Dictionary file '{file_path}' not found. Add the file or try running the build.dictonary.{script_extension} script in the repo.")
+                f"Dictionary file '{file_path}' not found. "
+                f"Run build_dictionary.{"bat" if IS_WINDOWS else "sh"} to create it."
+            )
             return False
         except Exception as e:
-            logger.error(f"ERROR: Failed to load dictionary from {file_path}: {e}")
+            logger.error(f"Failed to load dictionary from '{file_path}': {e}")
             return False
+
+    def _validate(self):
+        """
+        Scan the loaded dictionary for structural invariants and log warnings
+        for any violations found. Never raises — validation is advisory only.
+
+        Invariants checked:
+          - Every map entry tuple has exactly 4 elements
+          - written_form is a non-empty str or None (None is valid for kana-only)
+          - reading is a str or None
+          - freq is an int
+          - entry_id exists in self.entries
+          - A map entry reached via a kanji-containing key must not have
+            written_form=None (that would render as an invisible entry)
+        """
+        issues = 0
+        missing_entry_ids = set()
+
+        for surface, me_list in self.lookup_map.items():
+            surface_has_kanji = any(0x4E00 <= ord(c) <= 0x9FFF for c in surface)
+            for me in me_list:
+                if len(me) != 4:
+                    logger.warning(
+                        f"Malformed map entry under key '{surface}': "
+                        f"expected 4 fields, got {len(me)} — {me!r}"
+                    )
+                    issues += 1
+                    continue
+
+                wf, rd, freq, entry_id = me
+
+                if wf is not None and not isinstance(wf, str):
+                    logger.warning(
+                        f"Map entry under '{surface}': written_form is {type(wf).__name__} "
+                        f"(expected str or None) — entry_id={entry_id}"
+                    )
+                    issues += 1
+
+                if rd is not None and not isinstance(rd, str):
+                    logger.warning(
+                        f"Map entry under '{surface}': reading is {type(rd).__name__} "
+                        f"(expected str or None) — entry_id={entry_id}"
+                    )
+                    issues += 1
+
+                if not isinstance(freq, int):
+                    logger.warning(
+                        f"Map entry under '{surface}': freq is {type(freq).__name__} "
+                        f"(expected int) — entry_id={entry_id}"
+                    )
+                    issues += 1
+
+                if surface_has_kanji and wf is None:
+                    logger.warning(
+                        f"Map entry under kanji key '{surface}' has written_form=None "
+                        f"(entry will display incorrectly) — entry_id={entry_id}"
+                    )
+                    issues += 1
+
+                if entry_id not in self.entries:
+                    missing_entry_ids.add(entry_id)
+                    issues += 1
+
+        if missing_entry_ids:
+            logger.warning(
+                f"{len(missing_entry_ids)} entry ID(s) referenced in lookup_map "
+                f"have no matching core entry — first few: "
+                f"{sorted(missing_entry_ids)[:5]}"
+            )
+
+        if issues == 0:
+            logger.info("Dictionary validation passed with no issues.")
+        else:
+            logger.warning(f"Dictionary validation found {issues} issue(s) — "
+                           f"some entries may display incorrectly.")
